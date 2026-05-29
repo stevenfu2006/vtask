@@ -1,0 +1,8 @@
+trl>=0.12.0
+transformers>=4.47.0
+accelerate>=1.2.0
+torch>=2.1.0
+wandb
+datasets
+peft
+bitsandbytes

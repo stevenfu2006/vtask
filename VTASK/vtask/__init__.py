@@ -1,0 +1,5 @@
+from vtask.registry import create_dataset, list_domains
+from vtask.base import TaskEntry, TaskDataset, TaskGenerator
+
+__version__ = "0.1.0"
+__all__ = ["create_dataset", "list_domains", "TaskEntry", "TaskDataset", "TaskGenerator"]

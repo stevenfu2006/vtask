@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "VTASK"
+version = "0.1.0"
+description = "Multi-domain verifiable task engine for RL training data generation"
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=3.0",
+]
+
+[project.optional-dependencies]
+eval = ["anthropic>=0.40.0"]
+dev = ["pytest>=7.0", "pytest-cov"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["VTASK"]
