@@ -1,0 +1,12 @@
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+.DS_Store
+checkpoints/
+*.jsonl
+scheduling.jsonl
+ui/frontend/dist/
