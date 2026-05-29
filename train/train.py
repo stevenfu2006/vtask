@@ -1,168 +1,190 @@
 #!/usr/bin/env python3
 """
-GRPO fine-tuning script for VTASK domains.
-
-Uses TRL's GRPOTrainer with VTASK's RewardFunction to train a model
-on procedurally generated reasoning tasks.
+VTASK RL Training Script — GRPO with verifiable rewards.
 
 Usage:
-  python train/train.py --model Qwen/Qwen2.5-1.5B-Instruct --domain scheduling
-  python train/train.py --model Qwen/Qwen2.5-7B-Instruct --domain all --steps 500
-"""
-from __future__ import annotations
-import argparse
-import os
-import sys
+  python train/train.py \
+    --model Qwen/Qwen2.5-1.5B-Instruct \
+    --domain scheduling \
+    --steps 500 \
+    --batch-size 8 \
+    --output-dir checkpoints/scheduling
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import GRPOConfig, GRPOTrainer
+  python train/train.py --model Qwen/Qwen2.5-1.5B-Instruct --domain all
+"""
+import argparse
+import random
+import re
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import VTASK
-from VTASK.registry import REGISTRY
-from VTASK.training import RewardFunction, VTASKDataset, format_chat_prompt
+from VTASK.training import format_chat_prompt, SYSTEM_PROMPT
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GRPO training on VTASK domains")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct",
-                        help="HuggingFace model ID or local path")
-    parser.add_argument("--domain", default="scheduling",
-                        help="Domain name or 'all' for mixed training")
-    parser.add_argument("--difficulty", type=int, default=None,
-                        help="Fix difficulty (1-5). Default: mixed.")
-    parser.add_argument("--steps", type=int, default=200,
-                        help="Number of training steps")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Per-device training batch size")
-    parser.add_argument("--dataset-size", type=int, default=500,
-                        help="Number of tasks to generate for training")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-dir", default="./output",
-                        help="Directory to save checkpoints")
-    parser.add_argument("--learning-rate", type=float, default=5e-6)
-    parser.add_argument("--wandb-project", default="vtask-grpo",
-                        help="Weights & Biases project name")
-    parser.add_argument("--no-wandb", action="store_true",
-                        help="Disable Weights & Biases logging")
-    return parser.parse_args()
+def extract_answer(completion: str) -> str:
+    """Extract answer from model completion. Handles <answer> tags and plain text."""
+    completion = completion.strip()
+    tag_match = re.search(r'<answer>(.*?)</answer>', completion, re.DOTALL)
+    if tag_match:
+        return tag_match.group(1).strip()
+    lines = [l.strip() for l in completion.split('\n') if l.strip()]
+    return lines[-1] if lines else completion
 
 
-def build_dataset(domain: str, size: int, seed: int, difficulty: int | None,
-                  generator, reward_fn: RewardFunction) -> "datasets.Dataset":
-    task_ds = generator.create_dataset(size=size, seed=seed, difficulty=difficulty)
-    vtask_ds = VTASKDataset(task_ds, reward_fn)
-    return vtask_ds.to_hf_dataset()
+def make_reward_fn(generators: dict):
+    """
+    Returns a TRL 1.5.1 compatible reward function.
+
+    TRL passes extra dataset columns as kwargs.
+    We store correct_answer and domain in the dataset,
+    so they arrive here as lists in kwargs.
+    """
+    def reward_fn(completions, prompts=None, **kwargs):
+        correct_answers = kwargs.get('correct_answer', [])
+        domains = kwargs.get('domain', [])
+        scores = []
+
+        for i, completion in enumerate(completions):
+            try:
+                extracted = extract_answer(completion)
+                correct = correct_answers[i] if i < len(correct_answers) else ''
+
+                # Normalize both for comparison
+                extracted_norm = extracted.strip().lower().replace(',', '')
+                correct_norm = correct.strip().lower().replace(',', '')
+
+                score = 1.0 if extracted_norm == correct_norm else 0.0
+                scores.append(score)
+            except Exception:
+                scores.append(0.0)
+
+        return scores
+
+    return reward_fn
 
 
-def main() -> None:
-    args = parse_args()
+def build_dataset(domains: list, size: int, seed: int, difficulty: int | None):
+    """Generate training tasks and return as HuggingFace Dataset."""
+    from datasets import Dataset
 
-    if args.no_wandb:
-        os.environ["WANDB_DISABLED"] = "true"
-    elif args.wandb_project:
-        os.environ["WANDB_PROJECT"] = args.wandb_project
+    all_items = []
+    rng = random.Random(seed)
 
-    # Resolve domain(s)
-    if args.domain == "all":
-        domain_names = VTASK.list_domains()
-    else:
-        if args.domain not in REGISTRY:
-            print(f"Unknown domain '{args.domain}'. Available: {VTASK.list_domains()}", file=sys.stderr)
-            sys.exit(1)
-        domain_names = [args.domain]
+    for domain in domains:
+        domain_size = size // len(domains)
+        ds = VTASK.create_dataset(domain, size=domain_size, seed=rng.randint(0, 2**31), difficulty=difficulty)
+
+        for entry in ds.entries:
+            prompt = format_chat_prompt(entry)
+            all_items.append({
+                'prompt': prompt,
+                'correct_answer': entry.answer,
+                'domain': entry.domain,
+                'difficulty': entry.difficulty,
+                'task_id': entry.task_id,
+            })
+
+    rng.shuffle(all_items)
+
+    # Sanity check
+    if all_items:
+        print(f"Sample task [{all_items[0]['domain']}]: {all_items[0]['prompt'][-1]['content'][:80]}...")
+        print(f"Correct answer: {all_items[0]['correct_answer']}")
+
+    return Dataset.from_list(all_items)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', default='Qwen/Qwen2.5-1.5B-Instruct')
+    parser.add_argument('--domain', default='all')
+    parser.add_argument('--difficulty', type=int, default=None)
+    parser.add_argument('--steps', type=int, default=500)
+    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--dataset-size', type=int, default=2000)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--output-dir', default='checkpoints/vtask-run')
+    parser.add_argument('--learning-rate', type=float, default=5e-6)
+    parser.add_argument('--no-wandb', action='store_true')
+    args = parser.parse_args()
+
+    domains = VTASK.list_domains() if args.domain == 'all' else [args.domain]
+    print(f"Training on domain(s): {domains}")
+    print(f"Model: {args.model}")
+    print(f"Steps: {args.steps} | Batch size: {args.batch_size}")
+
+    # Build dataset
+    print("Generating training tasks...")
+    dataset = build_dataset(
+        domains=domains,
+        size=args.dataset_size,
+        seed=args.seed,
+        difficulty=args.difficulty,
+    )
+    print(f"Dataset size: {len(dataset)} tasks | Steps: {args.steps}")
+
+    # Build reward function
+    from VTASK.registry import REGISTRY
+    generators = {d: REGISTRY[d]() for d in domains}
+    reward_fn = make_reward_fn(generators)
+
+    # Load model and tokenizer
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from trl import GRPOTrainer, GRPOConfig
+    import torch
 
     print(f"Loading model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map='auto',
         trust_remote_code=True,
     )
-
-    # Build combined dataset across all requested domains
-    all_datasets = []
-    reward_fns = {}
-    for domain_name in domain_names:
-        generator = REGISTRY[domain_name]()
-        reward_fn = RewardFunction(generator)
-        ds = build_dataset(
-            domain=domain_name,
-            size=args.dataset_size // len(domain_names),
-            seed=args.seed,
-            difficulty=args.difficulty,
-            generator=generator,
-            reward_fn=reward_fn,
-        )
-        all_datasets.append(ds)
-        reward_fns[domain_name] = (generator, reward_fn)
-
-    if len(all_datasets) == 1:
-        train_dataset = all_datasets[0]
-        primary_generator, primary_reward_fn = list(reward_fns.values())[0]
-    else:
-        from datasets import concatenate_datasets
-        train_dataset = concatenate_datasets(all_datasets).shuffle(seed=args.seed)
-        # For mixed training, use a unified reward function
-        primary_generator = None
-        primary_reward_fn = _MultiDomainReward(reward_fns)
-
-    def reward_wrapper(completions, prompts=None, **kwargs):
-        return primary_reward_fn(completions=completions, prompts=prompts, **kwargs)
 
     training_args = GRPOConfig(
         output_dir=args.output_dir,
         num_train_epochs=1,
         max_steps=args.steps,
         per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=max(1, 8 // args.batch_size),
+        gradient_accumulation_steps=4,
         learning_rate=args.learning_rate,
-        bf16=torch.cuda.is_available(),
+        bf16=True,
         logging_steps=10,
-        save_steps=100,
-        report_to="none" if args.no_wandb else "wandb",
-        remove_unused_columns=False,
+        save_steps=500,
+        report_to='none' if args.no_wandb else 'wandb',
+        run_name=f"vtask-{args.domain}-{args.model.split('/')[-1]}",
+        max_completion_length=512,
+        num_generations=4,
+        temperature=0.9,
+        seed=args.seed,
     )
+
+    if not args.no_wandb:
+        import wandb
+        wandb.init(project='vtask-training', config=vars(args))
 
     trainer = GRPOTrainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        tokenizer=tokenizer,
-        reward_funcs=[reward_wrapper],
+        train_dataset=dataset,
+        reward_funcs=reward_fn,
+        processing_class=tokenizer,
     )
 
-    print(f"Training on domain(s): {domain_names}")
-    print(f"Dataset size: {len(train_dataset)} tasks | Steps: {args.steps}")
+    print("Starting training...")
     trainer.train()
+
+    print(f"Saving to {args.output_dir}...")
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"Saved to {args.output_dir}")
+    print("Done.")
 
 
-class _MultiDomainReward:
-    """Unified reward function for mixed-domain training."""
-
-    def __init__(self, reward_fns: dict):
-        self._fns = {k: v[1] for k, v in reward_fns.items()}
-
-    def __call__(self, completions, prompts=None, **kwargs):
-        rewards = []
-        if prompts is None:
-            prompts = [None] * len(completions)
-        for completion, prompt in zip(completions, prompts):
-            score = 0.0
-            for fn in self._fns.values():
-                result = fn([completion], [prompt])
-                if result[0] > 0.0:
-                    score = result[0]
-                    break
-            rewards.append(score)
-        return rewards
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
