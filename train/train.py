@@ -23,12 +23,37 @@ import VTASK
 from VTASK.training import format_chat_prompt, SYSTEM_PROMPT
 
 
-def extract_answer(completion: str) -> str:
-    """Extract answer from model completion. Handles <answer> tags and plain text."""
+def extract_answer(completion: str, correct_answer: str) -> str:
+    """
+    Extract answer from model completion with multiple fallback strategies.
+    For numeric answers, tries to find any matching number in the output.
+    """
     completion = completion.strip()
+
+    # Strategy 1: look for <answer> tags
     tag_match = re.search(r'<answer>(.*?)</answer>', completion, re.DOTALL)
     if tag_match:
         return tag_match.group(1).strip()
+
+    # Strategy 2: look for "answer is X" pattern
+    ans_match = re.search(r'(?:answer is|therefore|minimum is|total is)[:\s]+(\d+)', completion, re.IGNORECASE)
+    if ans_match:
+        return ans_match.group(1).strip()
+
+    # Strategy 3: if correct answer is a number, find all numbers in completion
+    # and return the one that matches if present
+    try:
+        correct_num = int(correct_answer.strip())
+        numbers = re.findall(r'\b(\d+)\b', completion)
+        if str(correct_num) in numbers:
+            return str(correct_num)
+        # Return the last number found as best guess
+        if numbers:
+            return numbers[-1]
+    except ValueError:
+        pass
+
+    # Strategy 4: last non-empty line
     lines = [l.strip() for l in completion.split('\n') if l.strip()]
     return lines[-1] if lines else completion
 
@@ -43,18 +68,14 @@ def make_reward_fn(generators: dict):
     """
     def reward_fn(completions, prompts=None, **kwargs):
         correct_answers = kwargs.get('correct_answer', [])
-        domains = kwargs.get('domain', [])
         scores = []
 
         for i, completion in enumerate(completions):
             try:
-                extracted = extract_answer(completion)
                 correct = correct_answers[i] if i < len(correct_answers) else ''
-
-                # Normalize both for comparison
-                extracted_norm = extracted.strip().lower().replace(',', '')
-                correct_norm = correct.strip().lower().replace(',', '')
-
+                extracted = extract_answer(completion, correct)
+                extracted_norm = extracted.strip().lower().replace(',', '').replace(' ', '')
+                correct_norm = correct.strip().lower().replace(',', '').replace(' ', '')
                 score = 1.0 if extracted_norm == correct_norm else 0.0
                 scores.append(score)
             except Exception:

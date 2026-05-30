@@ -10,9 +10,12 @@ from VTASK.base import TaskEntry
 
 SYSTEM_PROMPT = (
     "You are solving reasoning problems. "
-    "Think through the problem carefully, then provide your final answer. "
-    "Wrap your final answer in <answer> and </answer> tags. "
-    "Example: <answer>42</answer>"
+    "You must always end your response with your final answer on the last line "
+    "wrapped in answer tags like this: <answer>42</answer>. "
+    "Do not include units, just the number or value. "
+    "Example: if the answer is 8 hours, write <answer>8</answer>. "
+    "If the answer is yes, write <answer>yes</answer>. "
+    "Always include the answer tags. Never skip them."
 )
 
 
